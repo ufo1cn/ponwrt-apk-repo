@@ -1,0 +1,195 @@
+# ==============================================================================
+# PonWrt apk 软件仓库：自动验签 / 补签 + 重建签名索引
+# ------------------------------------------------------------------------------
+# 作用：
+#   1) 扫描 repo 分支 aarch64_cortex-a53/ponwrt 下全部 .apk，用固定公钥逐个验签；
+#      不是本钥签发的（例如 secret 缺失时用临时密钥签的、或压根没签的）就地重签，
+#      内容与元数据不变，只替换签名块（apk adbsign，实测 adbdump/manifest 完全一致）。
+#   2) 用 apk mkndx 对「整个目录」重建 packages.adb 并签名 —— 这是修掉多工作流
+#      各自只索引自己那几个包、互相覆盖索引的根因。
+#   3) 重算 SHA256SUMS。
+#   4) 包集合与索引内容都没变时不提交（避免每 10 分钟刷空 commit）。
+#
+# 触发：定时（每 10 分钟）+ 手动 + 上游 build 工作流 repository_dispatch(reindex)
+#
+# 设备侧：/etc/apk/repositories.d/*.list 里写「索引文件完整 URL」
+#   https://raw.githubusercontent.com/ufo1cn/ponwrt-apk-repo/repo/aarch64_cortex-a53/ponwrt/packages.adb
+#   （apk v3 对不带类型的裸 URL 会当成 v2 目录源去取 <url>/<arch>/APKINDEX.tar.gz，所以必须指到 packages.adb）
+#   公钥放 /etc/apk/keys/public-key.pem
+# ==============================================================================
+
+name: Reindex apk repository (verify + sign + index)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制重建索引并提交（忽略幂等判断）"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "*/10 * * * *"
+  repository_dispatch:
+    types: [reindex]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-repo-reindex
+  cancel-in-progress: false
+
+env:
+  APK_TOOLS_VER: "3.0.8"
+  DEST_DIR: "aarch64_cortex-a53/ponwrt"
+
+jobs:
+  reindex:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repo branch
+        uses: actions/checkout@v4
+        with:
+          ref: repo
+          fetch-depth: 0
+
+      - name: Install signing key
+        env:
+          APK_SIGNING_PRIVATE_KEY: ${{ secrets.APK_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APK_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::仓库未配置 APK_SIGNING_PRIVATE_KEY，无法签名索引（设备会报 UNTRUSTED），本轮中止"
+            exit 1
+          fi
+          printf '%s\n' "$APK_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/private-key.pem"
+          chmod 600 "$RUNNER_TEMP/private-key.pem"
+          mkdir -p "$RUNNER_TEMP/keys"
+          openssl ec -in "$RUNNER_TEMP/private-key.pem" -pubout -out "$RUNNER_TEMP/keys/public-key.pem" 2>/dev/null
+          sha256sum "$RUNNER_TEMP/keys/public-key.pem"
+          # 仓库根的公钥必须与私钥推导出来的一致，否则设备信任链断
+          if [ -f public-key.pem ] && ! cmp -s public-key.pem "$RUNNER_TEMP/keys/public-key.pem"; then
+            echo ">>> 仓库根 public-key.pem 与私钥不匹配，更新为新公钥"
+            cp -f "$RUNNER_TEMP/keys/public-key.pem" public-key.pem
+          fi
+
+      - name: Build apk-tools (static)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libssl-dev zlib1g-dev libzstd-dev meson ninja-build >/dev/null
+          cd "$RUNNER_TEMP"
+          curl -sSL -o apk-tools.tar.gz \
+            "https://codeload.github.com/alpinelinux/apk-tools/tar.gz/refs/tags/v${APK_TOOLS_VER}"
+          mkdir -p apk-tools-src
+          tar xzf apk-tools.tar.gz -C apk-tools-src --strip-components=1
+          cd apk-tools-src
+          meson setup -Dc_link_args="-static" -Dprefer_static=true -Ddefault_library=static build >/dev/null
+          ninja -C build src/apk >/dev/null
+          cp -f build/src/apk "$RUNNER_TEMP/apk"
+          "$RUNNER_TEMP/apk" --version
+
+      - name: Verify, re-sign and rebuild index
+        id: build_index
+        run: |
+          set -euo pipefail
+          APK="$RUNNER_TEMP/apk"
+          PRIV="$RUNNER_TEMP/private-key.pem"
+          KEYS="$RUNNER_TEMP/keys"
+          DEST="$GITHUB_WORKSPACE/${DEST_DIR}"
+          cd "$DEST"
+          shopt -s nullglob
+          files=(*.apk)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::${DEST_DIR} 里没有任何 apk，拒绝生成空索引"
+            exit 1
+          fi
+          echo ">>> 目录内 apk 数量：${#files[@]}"
+
+          resigned=0
+          bad=0
+          for f in "${files[@]}"; do
+            if "$APK" verify --keys-dir "$KEYS" "$PWD/$f" >/dev/null 2>&1; then
+              continue
+            fi
+            echo ">>> 重签（原签名非本钥/缺失）：$f"
+            if "$APK" adbsign --allow-untrusted --reset-signatures --sign-key "$PRIV" "$PWD/$f"; then
+              resigned=$((resigned+1))
+            else
+              echo "::error::$f 重签失败"
+              bad=$((bad+1))
+            fi
+          done
+          echo ">>> 重签数量：$resigned，失败：$bad"
+          [ "$bad" -eq 0 ] || exit 1
+
+          # 重签后必须全部通过本钥校验，否则不允许发布索引
+          if ! "$APK" verify --keys-dir "$KEYS" "${files[@]}"; then
+            echo "::error::仍有 apk 无法通过本钥验签，索引未更新"
+            exit 1
+          fi
+
+          echo ">>> 生成签名索引 packages.adb"
+          "$APK" mkndx --allow-untrusted --sign-key "$PRIV" \
+                 --output "$RUNNER_TEMP/packages.adb" "${files[@]}"
+          if ! "$APK" verify --keys-dir "$KEYS" "$RUNNER_TEMP/packages.adb"; then
+            echo "::error::新索引无法通过本钥验签"
+            exit 1
+          fi
+
+          # 幂等判断：索引里的 (name,version,hashes) 集合与现网完全一致 → 不提交
+          "$APK" adbdump "$RUNNER_TEMP/packages.adb" > "$RUNNER_TEMP/new.dump" 2>/dev/null
+          if [ -f packages.adb ]; then
+            "$APK" adbdump packages.adb > "$RUNNER_TEMP/old.dump" 2>/dev/null || : > "$RUNNER_TEMP/old.dump"
+          else
+            : > "$RUNNER_TEMP/old.dump"
+          fi
+          norm() {
+            awk '/^  - name: /{n=$0; sub(/^  - name: /,"",n); cur=n; v=""; h=""; next}
+                 /^    version: /{v=$0; sub(/^    version: /,"",v); next}
+                 /^    hashes: /{h=$0; sub(/^    hashes: /,"",h); if(cur!=""){print cur"|"v"|"h; cur=""}}' "$1" | sort
+          }
+          norm "$RUNNER_TEMP/old.dump" > /tmp/old.norm
+          norm "$RUNNER_TEMP/new.dump" > /tmp/new.norm
+          if cmp -s /tmp/old.norm /tmp/new.norm; then same=1; else same=0; fi
+          echo ">>> 旧索引 $(wc -l < /tmp/old.norm) 个包 / 新索引 $(wc -l < /tmp/new.norm) 个包，内容一致=$same"
+          cp -f "$RUNNER_TEMP/packages.adb" packages.adb
+          sha256sum ./*.apk > SHA256SUMS
+          {
+            printf 'PonWrt apk 仓库（AN7581 系列）\n'
+            printf '包数量：%s（本次重签 %s 个）\n' "${#files[@]}" "$resigned"
+            printf '索引：packages.adb（本钥签名，设备免 --allow-untrusted）\n'
+            printf '公钥：仓库根 public-key.pem；设备侧放 /etc/apk/keys/public-key.pem\n'
+            printf '源地址（repositories.d 里写这一整条）：\n'
+            printf 'https://raw.githubusercontent.com/ufo1cn/ponwrt-apk-repo/repo/aarch64_cortex-a53/ponwrt/packages.adb\n'
+          } > README.txt
+
+          echo "index_same=$same" >> "$GITHUB_OUTPUT"
+          echo "resigned=$resigned" >> "$GITHUB_OUTPUT"
+          echo "apk_count=${#files[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        if: steps.build_index.outputs.index_same == '0' || inputs.force || github.event_name != 'schedule'
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git config user.email "ci@ponwrt"
+          git config user.name "ponwrt-apk-ci"
+          git add -A
+          if git diff --cached --quiet; then
+            echo ">>> 无变更，跳过提交"
+            exit 0
+          fi
+          git commit -m "reindex: apk=${{ steps.build_index.outputs.apk_count }} resigned=${{ steps.build_index.outputs.resigned }} same=${{ steps.build_index.outputs.index_same }} [skip ci]"
+          for i in 1 2 3 4; do
+            if git push origin HEAD:repo; then
+              echo ">>> 已推送到 repo 分支"
+              exit 0
+            fi
+            echo ">>> 推送被拒（上游有新提交），第 $i 次 rebase 重试"
+            git fetch origin repo
+            git rebase origin/repo || { echo "::error::rebase 冲突，需人工处理"; exit 1; }
+          done
+          echo "::error::推送失败（重试 4 次）"
+          exit 1
