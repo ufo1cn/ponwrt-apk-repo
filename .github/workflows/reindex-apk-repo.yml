@@ -1,20 +1,25 @@
 # ==============================================================================
-# PonWrt apk 软件仓库：自动验签 / 补签 + 重建签名索引
+# PonWrt apk 软件仓库：自动验签 / 补签 + 重建签名索引（按目录分组）
 # ------------------------------------------------------------------------------
+# 目录结构（apk 的兼容键是 arch + libc + 内核 vermagic，与机型无关，所以主目录
+# 按内核版本分；机型差异用 common / usb 两个索引表达）：
+#
+#   aarch64_cortex-a53/ponwrt-k<kver>/common/  通用包（用户态 + 与机型无关的 kmod）
+#   aarch64_cortex-a53/ponwrt-k<kver>/usb/     仅 USB 栈（只给 HG5585F-CT 挂）
+#   aarch64_cortex-a53/ponwrt/                 旧目录，迁移期保留（不再写入新包）
+#
+# 每个目录各自一份 packages.adb（本钥签名），互不覆盖。
 # 作用：
-#   1) 扫描 repo 分支 aarch64_cortex-a53/ponwrt 下全部 .apk，用固定公钥逐个验签；
-#      不是本钥签发的（例如 secret 缺失时用临时密钥签的、或压根没签的）就地重签，
-#      内容与元数据不变，只替换签名块（apk adbsign，实测 adbdump/manifest 完全一致）。
-#   2) 用 apk mkndx 对「整个目录」重建 packages.adb 并签名 —— 这是修掉多工作流
-#      各自只索引自己那几个包、互相覆盖索引的根因。
-#   3) 重算 SHA256SUMS。
-#   4) 包集合与索引内容都没变时不提交（避免每 10 分钟刷空 commit）。
+#   1) 扫描每个目录里的 .apk，用固定公钥逐个验签；不是本钥签发就地重签；
+#   2) 每个目录各建一份 packages.adb（修掉多工作流互相覆盖索引的老问题）；
+#   3) 重算 SHA256SUMS；
+#   4) 包集合与索引内容都没变时不提交。
 #
 # 触发：定时（每 10 分钟）+ 手动 + 上游 build 工作流 repository_dispatch(reindex)
 #
-# 设备侧：/etc/apk/repositories.d/*.list 里写「索引文件完整 URL」
-#   https://raw.githubusercontent.com/ufo1cn/ponwrt-apk-repo/repo/aarch64_cortex-a53/ponwrt/packages.adb
-#   （apk v3 对不带类型的裸 URL 会当成 v2 目录源去取 <url>/<arch>/APKINDEX.tar.gz，所以必须指到 packages.adb）
+# 设备侧：/etc/apk/repositories.d/*.list 里写「索引文件完整 URL」：
+#   https://raw.githubusercontent.com/ufo1cn/ponwrt-apk-repo/repo/aarch64_cortex-a53/ponwrt-k6.18.60/common/packages.adb
+#   （apk v3 对裸 URL 会当成 v2 目录源去取 <url>/<arch>/APKINDEX.tar.gz，必须指到 packages.adb）
 #   公钥放 /etc/apk/keys/public-key.pem
 # ==============================================================================
 
@@ -41,7 +46,7 @@ concurrency:
 
 env:
   APK_TOOLS_VER: "3.0.8"
-  DEST_DIR: "aarch64_cortex-a53/ponwrt"
+  ARCH_ROOT: "aarch64_cortex-a53"
 
 jobs:
   reindex:
@@ -90,84 +95,106 @@ jobs:
           cp -f build/src/apk "$RUNNER_TEMP/apk"
           "$RUNNER_TEMP/apk" --version
 
-      - name: Verify, re-sign and rebuild index
+      - name: Verify, re-sign and rebuild index (per directory)
         id: build_index
         run: |
           set -euo pipefail
           APK="$RUNNER_TEMP/apk"
           PRIV="$RUNNER_TEMP/private-key.pem"
           KEYS="$RUNNER_TEMP/keys"
-          DEST="$GITHUB_WORKSPACE/${DEST_DIR}"
-          cd "$DEST"
-          shopt -s nullglob
-          files=(*.apk)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::${DEST_DIR} 里没有任何 apk，拒绝生成空索引"
+          cd "$GITHUB_WORKSPACE"
+
+          # 找出所有含 apk 的目录（每层目录各一份索引）
+          mapfile -t DIRS < <(find "$ARCH_ROOT" -maxdepth 3 -type d 2>/dev/null | sort | while read -r d; do
+            compgen -G "$d/*.apk" >/dev/null && echo "$d"
+          done)
+          if [ ${#DIRS[@]} -eq 0 ]; then
+            echo "::error::${ARCH_ROOT} 下找不到任何含 apk 的目录，拒绝生成空索引"
             exit 1
           fi
-          echo ">>> 目录内 apk 数量：${#files[@]}"
+          echo ">>> 需要重建索引的目录（${#DIRS[@]} 个）：${DIRS[*]}"
 
-          resigned=0
-          bad=0
-          for f in "${files[@]}"; do
-            if "$APK" verify --keys-dir "$KEYS" "$PWD/$f" >/dev/null 2>&1; then
-              continue
+          total=0
+          resigned_all=0
+          all_same=1
+          for DEST_REL in "${DIRS[@]}"; do
+            DEST="$GITHUB_WORKSPACE/$DEST_REL"
+            echo ""
+            echo "=================== $DEST_REL ==================="
+            cd "$DEST"
+            shopt -s nullglob
+            files=(*.apk)
+            echo ">>> 目录内 apk 数量：${#files[@]}"
+            total=$((total + ${#files[@]}))
+
+            resigned=0
+            bad=0
+            for f in "${files[@]}"; do
+              if "$APK" verify --keys-dir "$KEYS" "$PWD/$f" >/dev/null 2>&1; then
+                continue
+              fi
+              echo ">>> 重签（原签名非本钥/缺失）：$f"
+              if "$APK" adbsign --allow-untrusted --reset-signatures --sign-key "$PRIV" "$PWD/$f"; then
+                resigned=$((resigned+1))
+              else
+                echo "::error::$f 重签失败"
+                bad=$((bad+1))
+              fi
+            done
+            echo ">>> 重签数量：$resigned，失败：$bad"
+            [ "$bad" -eq 0 ] || exit 1
+            resigned_all=$((resigned_all + resigned))
+
+            # 重签后必须全部通过本钥校验，否则不允许发布索引
+            if ! "$APK" verify --keys-dir "$KEYS" "${files[@]}"; then
+              echo "::error::${DEST_REL} 仍有 apk 无法通过本钥验签，该目录索引未更新"
+              exit 1
             fi
-            echo ">>> 重签（原签名非本钥/缺失）：$f"
-            if "$APK" adbsign --allow-untrusted --reset-signatures --sign-key "$PRIV" "$PWD/$f"; then
-              resigned=$((resigned+1))
+
+            echo ">>> 生成签名索引 packages.adb（$DEST_REL）"
+            "$APK" mkndx --allow-untrusted --sign-key "$PRIV" \
+                   --output "$RUNNER_TEMP/packages.adb" "${files[@]}"
+            if ! "$APK" verify --keys-dir "$KEYS" "$RUNNER_TEMP/packages.adb"; then
+              echo "::error::${DEST_REL} 新索引无法通过本钥验签"
+              exit 1
+            fi
+
+            # 幂等判断：索引里的 (name,version,hashes) 集合与现网完全一致 → 该目录不提交
+            "$APK" adbdump "$RUNNER_TEMP/packages.adb" > "$RUNNER_TEMP/new.dump" 2>/dev/null
+            if [ -f packages.adb ]; then
+              "$APK" adbdump packages.adb > "$RUNNER_TEMP/old.dump" 2>/dev/null || : > "$RUNNER_TEMP/old.dump"
             else
-              echo "::error::$f 重签失败"
-              bad=$((bad+1))
+              : > "$RUNNER_TEMP/old.dump"
             fi
-          done
-          echo ">>> 重签数量：$resigned，失败：$bad"
-          [ "$bad" -eq 0 ] || exit 1
-
-          # 重签后必须全部通过本钥校验，否则不允许发布索引
-          if ! "$APK" verify --keys-dir "$KEYS" "${files[@]}"; then
-            echo "::error::仍有 apk 无法通过本钥验签，索引未更新"
-            exit 1
-          fi
-
-          echo ">>> 生成签名索引 packages.adb"
-          "$APK" mkndx --allow-untrusted --sign-key "$PRIV" \
-                 --output "$RUNNER_TEMP/packages.adb" "${files[@]}"
-          if ! "$APK" verify --keys-dir "$KEYS" "$RUNNER_TEMP/packages.adb"; then
-            echo "::error::新索引无法通过本钥验签"
-            exit 1
-          fi
-
-          # 幂等判断：索引里的 (name,version,hashes) 集合与现网完全一致 → 不提交
-          "$APK" adbdump "$RUNNER_TEMP/packages.adb" > "$RUNNER_TEMP/new.dump" 2>/dev/null
-          if [ -f packages.adb ]; then
-            "$APK" adbdump packages.adb > "$RUNNER_TEMP/old.dump" 2>/dev/null || : > "$RUNNER_TEMP/old.dump"
-          else
-            : > "$RUNNER_TEMP/old.dump"
-          fi
-          norm() {
             awk '/^  - name: /{n=$0; sub(/^  - name: /,"",n); cur=n; v=""; h=""; next}
                  /^    version: /{v=$0; sub(/^    version: /,"",v); next}
-                 /^    hashes: /{h=$0; sub(/^    hashes: /,"",h); if(cur!=""){print cur"|"v"|"h; cur=""}}' "$1" | sort
-          }
-          norm "$RUNNER_TEMP/old.dump" > /tmp/old.norm
-          norm "$RUNNER_TEMP/new.dump" > /tmp/new.norm
-          if cmp -s /tmp/old.norm /tmp/new.norm; then same=1; else same=0; fi
-          echo ">>> 旧索引 $(wc -l < /tmp/old.norm) 个包 / 新索引 $(wc -l < /tmp/new.norm) 个包，内容一致=$same"
-          cp -f "$RUNNER_TEMP/packages.adb" packages.adb
-          sha256sum ./*.apk > SHA256SUMS
-          {
-            printf 'PonWrt apk 仓库（AN7581 系列）\n'
-            printf '包数量：%s（本次重签 %s 个）\n' "${#files[@]}" "$resigned"
-            printf '索引：packages.adb（本钥签名，设备免 --allow-untrusted）\n'
-            printf '公钥：仓库根 public-key.pem；设备侧放 /etc/apk/keys/public-key.pem\n'
-            printf '源地址（repositories.d 里写这一整条）：\n'
-            printf 'https://raw.githubusercontent.com/ufo1cn/ponwrt-apk-repo/repo/aarch64_cortex-a53/ponwrt/packages.adb\n'
-          } > README.txt
+                 /^    hashes: /{h=$0; sub(/^    hashes: /,"",h); if(cur!=""){print cur"|"v"|"h; cur=""}}' \
+                 "$RUNNER_TEMP/old.dump" | sort > /tmp/old.norm
+            awk '/^  - name: /{n=$0; sub(/^  - name: /,"",n); cur=n; v=""; h=""; next}
+                 /^    version: /{v=$0; sub(/^    version: /,"",v); next}
+                 /^    hashes: /{h=$0; sub(/^    hashes: /,"",h); if(cur!=""){print cur"|"v"|"h; cur=""}}' \
+                 "$RUNNER_TEMP/new.dump" | sort > /tmp/new.norm
+            if cmp -s /tmp/old.norm /tmp/new.norm; then same=1; else same=0; fi
+            echo ">>> ${DEST_REL}: 旧索引 $(wc -l < /tmp/old.norm) 个包 / 新索引 $(wc -l < /tmp/new.norm) 个包，内容一致=$same"
+            cp -f "$RUNNER_TEMP/packages.adb" packages.adb
+            sha256sum ./*.apk > SHA256SUMS
+            {
+              printf 'PonWrt apk 仓库目录 %s\n' "$DEST_REL"
+              printf '包数量：%s（本次重签 %s 个）\n' "${#files[@]}" "$resigned"
+              printf '索引：packages.adb（本钥签名，设备免 --allow-untrusted）\n'
+              printf '公钥：仓库根 public-key.pem；设备侧放 /etc/apk/keys/public-key.pem\n'
+              printf '源地址（repositories.d 里写这一整条）：\n'
+              printf 'https://raw.githubusercontent.com/ufo1cn/ponwrt-apk-repo/repo/%s/packages.adb\n' "$DEST_REL"
+            } > README.txt
+            [ "$same" = "1" ] || all_same=0
+            shopt -u nullglob
+          done
+          cd "$GITHUB_WORKSPACE"
 
-          echo "index_same=$same" >> "$GITHUB_OUTPUT"
-          echo "resigned=$resigned" >> "$GITHUB_OUTPUT"
-          echo "apk_count=${#files[@]}" >> "$GITHUB_OUTPUT"
+          echo "index_same=$all_same" >> "$GITHUB_OUTPUT"
+          echo "resigned=$resigned_all" >> "$GITHUB_OUTPUT"
+          echo "apk_count=$total" >> "$GITHUB_OUTPUT"
+          echo "dirs=${#DIRS[@]}" >> "$GITHUB_OUTPUT"
 
       - name: Commit and push
         if: steps.build_index.outputs.index_same == '0' || inputs.force || github.event_name != 'schedule'
@@ -181,7 +208,7 @@ jobs:
             echo ">>> 无变更，跳过提交"
             exit 0
           fi
-          git commit -m "reindex: apk=${{ steps.build_index.outputs.apk_count }} resigned=${{ steps.build_index.outputs.resigned }} same=${{ steps.build_index.outputs.index_same }} [skip ci]"
+          git commit -m "reindex: dirs=${{ steps.build_index.outputs.dirs }} apk=${{ steps.build_index.outputs.apk_count }} resigned=${{ steps.build_index.outputs.resigned }} same=${{ steps.build_index.outputs.index_same }} [skip ci]"
           for i in 1 2 3 4; do
             if git push origin HEAD:repo; then
               echo ">>> 已推送到 repo 分支"
