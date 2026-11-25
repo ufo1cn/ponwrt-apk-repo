@@ -4,10 +4,9 @@
 # 目录结构（apk 的兼容键是 arch + libc + 内核 vermagic，与机型无关，所以主目录
 # 按内核版本分；机型差异用 common / usb 两个索引表达）：
 #
-#   aarch64_cortex-a53/ponwrt-k<kver>/common/  通用包（用户态 + 与机型无关的 kmod）
-#   aarch64_cortex-a53/ponwrt-k<kver>/usb/     仅 USB 栈（只给 HG5585F-CT 挂）
-#   aarch64_cortex-a53/ponwrt/                 旧目录，迁移期保留（不再写入新包）
+#   aarch64_cortex-a53/ponwrt-k<kver>/<common|usb|wifi|bt>/  按机型能力分组
 #
+# 两条索引分支各跑一遍：repo（主线）与 repo-wed（WED 实验固件）。
 # 每个目录各自一份 packages.adb（本钥签名），互不覆盖。
 # 作用：
 #   1) 扫描每个目录里的 .apk，用固定公钥逐个验签；不是本钥签发就地重签；
@@ -15,7 +14,9 @@
 #   3) 重算 SHA256SUMS；
 #   4) 包集合与索引内容都没变时不提交。
 #
-# 触发：定时（每 10 分钟）+ 手动 + 上游 build 工作流 repository_dispatch(reindex)
+# 触发：定时（每 2 小时）+ 手动 + 上游 build 工作流 repository_dispatch(reindex)
+# 定位：兜底。正常发布由 pkg-publish.yml 在入库时自己重签索引，本工作流只负责
+#   修「手工塞进仓的包 / 发布中断留下的索引漂移」，并给两条分支各自的目录补签。
 #
 # 设备侧：/etc/apk/repositories.d/*.list 里写「索引文件完整 URL」：
 #   https://raw.githubusercontent.com/ufo1cn/ponwrt-apk-repo/repo/aarch64_cortex-a53/ponwrt-k6.18.60/common/packages.adb
@@ -33,16 +34,12 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "0 */2 * * *"
   repository_dispatch:
     types: [reindex]
 
 permissions:
   contents: write
-
-concurrency:
-  group: apk-repo-reindex
-  cancel-in-progress: false
 
 env:
   APK_TOOLS_VER: "3.0.8"
@@ -52,11 +49,19 @@ jobs:
   reindex:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [repo, repo-wed]
+    # 与 fw-publish / pkg-publish 共用同一把写锁（按索引分支区分），避免同分支并发推送
+    concurrency:
+      group: apk-repo-write-${{ matrix.branch }}
+      cancel-in-progress: false
     steps:
       - name: Checkout repo branch
         uses: actions/checkout@v4
         with:
-          ref: repo
+          ref: ${{ matrix.branch }}
           fetch-depth: 0
 
       - name: Install signing key
@@ -102,6 +107,7 @@ jobs:
           APK="$RUNNER_TEMP/apk"
           PRIV="$RUNNER_TEMP/private-key.pem"
           KEYS="$RUNNER_TEMP/keys"
+          BRANCH="${{ matrix.branch }}"
           cd "$GITHUB_WORKSPACE"
 
           # 找出所有含 apk 的目录（每层目录各一份索引）
@@ -109,8 +115,9 @@ jobs:
             compgen -G "$d/*.apk" >/dev/null && echo "$d"
           done)
           if [ ${#DIRS[@]} -eq 0 ]; then
-            echo "::error::${ARCH_ROOT} 下找不到任何含 apk 的目录，拒绝生成空索引"
-            exit 1
+            echo "::warning::${ARCH_ROOT} 下没有含 apk 的目录（分支 ${{ matrix.branch }} 还没有包），跳过本轮"
+            echo "skipped=1" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           echo ">>> 需要重建索引的目录（${#DIRS[@]} 个）：${DIRS[*]}"
 
@@ -184,20 +191,21 @@ jobs:
               printf '索引：packages.adb（本钥签名，设备免 --allow-untrusted）\n'
               printf '公钥：仓库根 public-key.pem；设备侧放 /etc/apk/keys/public-key.pem\n'
               printf '源地址（repositories.d 里写这一整条）：\n'
-              printf 'https://raw.githubusercontent.com/ufo1cn/ponwrt-apk-repo/repo/%s/packages.adb\n' "$DEST_REL"
+              printf 'https://raw.githubusercontent.com/ufo1cn/ponwrt-apk-repo/%s/%s/packages.adb\n' "$BRANCH" "$DEST_REL"
             } > README.txt
             [ "$same" = "1" ] || all_same=0
             shopt -u nullglob
           done
           cd "$GITHUB_WORKSPACE"
 
+          echo "skipped=0" >> "$GITHUB_OUTPUT"
           echo "index_same=$all_same" >> "$GITHUB_OUTPUT"
           echo "resigned=$resigned_all" >> "$GITHUB_OUTPUT"
           echo "apk_count=$total" >> "$GITHUB_OUTPUT"
           echo "dirs=${#DIRS[@]}" >> "$GITHUB_OUTPUT"
 
       - name: Commit and push
-        if: steps.build_index.outputs.index_same == '0' || inputs.force || github.event_name != 'schedule'
+        if: (steps.build_index.outputs.skipped != '1') && (steps.build_index.outputs.index_same == '0' || inputs.force || github.event_name != 'schedule')
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
@@ -208,15 +216,15 @@ jobs:
             echo ">>> 无变更，跳过提交"
             exit 0
           fi
-          git commit -m "reindex: dirs=${{ steps.build_index.outputs.dirs }} apk=${{ steps.build_index.outputs.apk_count }} resigned=${{ steps.build_index.outputs.resigned }} same=${{ steps.build_index.outputs.index_same }} [skip ci]"
+          git commit -m "reindex(${{ matrix.branch }}): dirs=${{ steps.build_index.outputs.dirs }} apk=${{ steps.build_index.outputs.apk_count }} resigned=${{ steps.build_index.outputs.resigned }} same=${{ steps.build_index.outputs.index_same }} [skip ci]"
           for i in 1 2 3 4; do
-            if git push origin HEAD:repo; then
-              echo ">>> 已推送到 repo 分支"
+            if git push origin HEAD:${{ matrix.branch }}; then
+              echo ">>> 已推送到 ${{ matrix.branch }} 分支"
               exit 0
             fi
             echo ">>> 推送被拒（上游有新提交），第 $i 次 rebase 重试"
-            git fetch origin repo
-            git rebase origin/repo || { echo "::error::rebase 冲突，需人工处理"; exit 1; }
+            git fetch origin ${{ matrix.branch }}
+            git rebase origin/${{ matrix.branch }} || { echo "::error::rebase 冲突，需人工处理"; exit 1; }
           done
           echo "::error::推送失败（重试 4 次）"
           exit 1
