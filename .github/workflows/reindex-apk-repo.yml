@@ -22,6 +22,9 @@
 #   https://raw.githubusercontent.com/ufo1cn/ponwrt-apk-repo/repo/aarch64_cortex-a53/ponwrt-k6.18.60/common/packages.adb
 #   （apk v3 对裸 URL 会当成 v2 目录源去取 <url>/<arch>/APKINDEX.tar.gz，必须指到 packages.adb）
 #   公钥放 /etc/apk/keys/public-key.pem
+#   Gitee 镜像（仓库镜像管理 Pull 模式，Gitee 服务器定时拉取本仓分支）同路径：
+#   https://gitee.com/ufo1cn/ponwrt-apk-repo/raw/repo/aarch64_cortex-a53/ponwrt-k6.18.60/common/packages.adb
+#   本工作流不再向 Gitee 推送（Pull 镜像下 Gitee 侧只读，且 runner 到 gitee.com 不通）。
 # ==============================================================================
 
 name: Reindex apk repository (verify + sign + index)
@@ -229,64 +232,6 @@ jobs:
           echo "::error::推送失败（重试 4 次）"
           exit 1
 
-      - name: Mirror snapshot to Gitee (single commit)
-        # 只镜像当前内容：单提交 + 强推，Gitee 分支永远只有 1 个 commit，体积≈当前文件量。
-        # 内容没变就不推（用 .snapshot-id 比对，只读一个几百字节的文件，不拉整仓）。
-        if: steps.build_index.outputs.skipped != '1'
-        env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GITEE_USER: ${{ secrets.GITEE_USER }}
-          GITEE_REPO: ${{ vars.GITEE_REPO }}
-          BRANCH: ${{ matrix.branch }}
-        run: |
-          set -uo pipefail
-          if [ -z "${GITEE_TOKEN:-}" ] || [ -z "${GITEE_REPO:-}" ] || [ -z "${GITEE_USER:-}" ]; then
-            echo "::warning::未配置 secrets GITEE_USER / GITEE_TOKEN 或变量 GITEE_REPO，跳过 Gitee 镜像"
-            exit 0
-          fi
-          owner="${GITEE_REPO%%/*}"
-          name="${GITEE_REPO##*/}"
-          echo ">>> 镜像分支 $BRANCH -> gitee.com/$GITEE_REPO"
-
-          # 1) 生成单提交快照（只含当前文件，不带任何历史）
-          rm -rf /tmp/snap && mkdir -p /tmp/snap
-          tar -C "$GITHUB_WORKSPACE" --exclude=.git -cf - . | tar -C /tmp/snap -xf -
-          cd /tmp/snap
-          manifest=$(find . -type f ! -name '.snapshot-id' -print0 | sort -z \
-            | xargs -0 -r sha256sum | sed 's#  \./#  #' | sha256sum | cut -d' ' -f1)
-          printf '%s\n' "$manifest" > .snapshot-id
-
-          # 2) 远端内容一致就跳过（Gitee API 只读 .snapshot-id）
-          remote=$(curl -fsS --max-time 20 \
-            "https://gitee.com/api/v5/repos/${owner}/${name}/contents/.snapshot-id?access_token=${GITEE_TOKEN}&ref=${BRANCH}" 2>/dev/null \
-            | python3 -c 'import base64,json,sys
-          d=json.load(sys.stdin)
-          print(base64.b64decode(d["content"]).decode("utf-8").strip())' 2>/dev/null || true)
-          if [ "$remote" = "$manifest" ]; then
-            echo ">>> Gitee/$BRANCH 与本地一致（${manifest:0:12}），跳过上传"
-            exit 0
-          fi
-
-          # 3) 单提交 + 强推：旧内容整条分支被替换，历史不累积
-          git init -q .
-          git config user.email ci@ponwrt
-          git config user.name ponwrt-ci
-          git add -A
-          git commit -qm "snapshot(${BRANCH}): $(date -u +%Y-%m-%dT%H:%MZ) manifest=${manifest:0:12}"
-          git remote add gitee "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
-
-          # 3.1) 先探测网络：GitHub 托管 runner 到 gitee.com 常被限速甚至挂死，
-          #      挂住会把整个 reindex job 拖到 25 分钟 timeout 一起被 cancel。
-          if ! timeout 30 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15 ls-remote gitee >/dev/null 2>&1; then
-            echo "::warning::GitHub runner 30s 内连不上 gitee.com，本轮跳过 Gitee 镜像（由本机定时任务兜底）"
-            exit 0
-          fi
-
-          # 3.2) 限速阈值 + 300s 硬超时：网络抖动时快速失败，不拖垮 job
-          if GIT_TERMINAL_PROMPT=0 timeout 300 \
-              git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 push --force gitee "HEAD:refs/heads/${BRANCH}"; then
-            echo ">>> 已强推 Gitee/$BRANCH（单提交快照 manifest=${manifest:0:12}）"
-          else
-            echo "::warning::推送 Gitee 失败或超时（300s）：token 权限 / 分支保护 / 网络；由本机定时任务兜底"
-          fi
+      # Gitee 侧改为「仓库镜像管理 → Pull」由 Gitee 服务器定时拉取本仓分支，
+      # 故不再从 GitHub runner 推送（runner 到 gitee.com 不通；Pull 镜像下 Gitee 侧为只读）。
 
