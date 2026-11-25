@@ -274,10 +274,19 @@ jobs:
           git add -A
           git commit -qm "snapshot(${BRANCH}): $(date -u +%Y-%m-%dT%H:%MZ) manifest=${manifest:0:12}"
           git remote add gitee "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
-          if git push --force gitee "HEAD:refs/heads/${BRANCH}"; then
+
+          # 3.1) 先探测网络：GitHub 托管 runner 到 gitee.com 常被限速甚至挂死，
+          #      挂住会把整个 reindex job 拖到 25 分钟 timeout 一起被 cancel。
+          if ! timeout 30 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15 ls-remote gitee >/dev/null 2>&1; then
+            echo "::warning::GitHub runner 30s 内连不上 gitee.com，本轮跳过 Gitee 镜像（由本机定时任务兜底）"
+            exit 0
+          fi
+
+          # 3.2) 限速阈值 + 300s 硬超时：网络抖动时快速失败，不拖垮 job
+          if GIT_TERMINAL_PROMPT=0 timeout 300 \
+              git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 push --force gitee "HEAD:refs/heads/${BRANCH}"; then
             echo ">>> 已强推 Gitee/$BRANCH（单提交快照 manifest=${manifest:0:12}）"
           else
-            echo "::error::推送 Gitee 失败：检查 token 权限 / 分支保护 / 仓库是否存在"
-            exit 1
+            echo "::warning::推送 Gitee 失败或超时（300s）：token 权限 / 分支保护 / 网络；由本机定时任务兜底"
           fi
 
