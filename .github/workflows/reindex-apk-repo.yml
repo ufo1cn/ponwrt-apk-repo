@@ -207,29 +207,39 @@ jobs:
           echo "apk_count=$total" >> "$GITHUB_OUTPUT"
           echo "dirs=${#DIRS[@]}" >> "$GITHUB_OUTPUT"
 
-      - name: Commit and push
+      - name: Publish single-commit snapshot (force push)
+        # 单提交快照：把当前工作树打成 1 个孤儿提交，强推覆盖索引分支。
+        # 结果：GitHub 的 repo / repo-wed 与 Gitee(Pull 镜像) 两侧都只保留最新一份内容，
+        # 提交历史不再累积（否则每 2 小时一个提交会一直涨，最终撞 Gitee 500MB 单仓上限）。
+        # 内容没变（index_same=1 且非手动/非 force）时整步跳过，避免空转强推。
         if: (steps.build_index.outputs.skipped != '1') && (steps.build_index.outputs.index_same == '0' || inputs.force || github.event_name != 'schedule')
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
           git config user.email "ci@ponwrt"
           git config user.name "ponwrt-apk-ci"
+
+          # 1) 内容指纹（排除 .git 与 .snapshot-id），写入 .snapshot-id 供设备/镜像比对
+          manifest=$(find . -path ./.git -prune -o -type f ! -name '.snapshot-id' -print0 \
+            | sort -z | xargs -0 -r sha256sum | sed 's#  \./#  #' | sha256sum | cut -d' ' -f1)
+          printf '%s\n' "$manifest" > .snapshot-id
+
+          # 2) 孤儿分支：新提交不带任何父提交，整棵树就是这一份快照
+          git checkout -q --orphan "snap-${{ github.run_id }}-${{ matrix.branch }}"
+
+          # 3) 提交并强推覆盖远端分支（不再 rebase 追历史）
           git add -A
-          if git diff --cached --quiet; then
-            echo ">>> 无变更，跳过提交"
-            exit 0
-          fi
-          git commit -m "reindex(${{ matrix.branch }}): dirs=${{ steps.build_index.outputs.dirs }} apk=${{ steps.build_index.outputs.apk_count }} resigned=${{ steps.build_index.outputs.resigned }} same=${{ steps.build_index.outputs.index_same }} [skip ci]"
-          for i in 1 2 3 4; do
-            if git push origin HEAD:${{ matrix.branch }}; then
-              echo ">>> 已推送到 ${{ matrix.branch }} 分支"
+          git commit -qm "snapshot(${{ matrix.branch }}): $(date -u +%Y-%m-%dT%H:%MZ) dirs=${{ steps.build_index.outputs.dirs }} apk=${{ steps.build_index.outputs.apk_count }} manifest=${manifest:0:12}"
+
+          for i in 1 2 3; do
+            if git push --force origin "HEAD:refs/heads/${{ matrix.branch }}"; then
+              echo ">>> 已强推单提交快照到 ${{ matrix.branch }}（manifest=${manifest:0:12}，apk=${{ steps.build_index.outputs.apk_count }}）"
               exit 0
             fi
-            echo ">>> 推送被拒（上游有新提交），第 $i 次 rebase 重试"
-            git fetch origin ${{ matrix.branch }}
-            git rebase origin/${{ matrix.branch }} || { echo "::error::rebase 冲突，需人工处理"; exit 1; }
+            echo ">>> 强推被拒，第 $i 次重试"
+            sleep 5
           done
-          echo "::error::推送失败（重试 4 次）"
+          echo "::error::强推失败（重试 3 次）：可能是分支保护或 token 权限"
           exit 1
 
       # Gitee 侧改为「仓库镜像管理 → Pull」由 Gitee 服务器定时拉取本仓分支，
