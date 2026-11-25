@@ -257,8 +257,8 @@ jobs:
           printf '%s\n' "$manifest" > .snapshot-id
 
           # 2) 远端内容一致就跳过（Gitee API 只读 .snapshot-id）
-          remote=$(curl -fsS --max-time 20 -H "Authorization: token ${GITEE_TOKEN}" \
-            "https://gitee.com/api/v5/repos/${owner}/${name}/contents/.snapshot-id?ref=${BRANCH}" 2>/dev/null \
+          remote=$(curl -fsS --max-time 20 \
+            "https://gitee.com/api/v5/repos/${owner}/${name}/contents/.snapshot-id?access_token=${GITEE_TOKEN}&ref=${BRANCH}" 2>/dev/null \
             | python3 -c 'import base64,json,sys
           d=json.load(sys.stdin)
           print(base64.b64decode(d["content"]).decode("utf-8").strip())' 2>/dev/null || true)
