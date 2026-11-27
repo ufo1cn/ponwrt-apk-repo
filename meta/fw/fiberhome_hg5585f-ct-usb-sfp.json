@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "device": "fiberhome_hg5585f-ct-usb-sfp",
+  "tag": "fw-fiberhome_hg5585f-ct-usb-sfp-r58-2b40bf9",
+  "run": 58,
+  "source_run_id": 45960014151,
+  "source_workflow": "fw-all.yml",
+  "commit": "2b40bf9810b493c656a6841007fb251a365ed843",
+  "kernel_version": "6.18.60",
+  "built_at": "2026-11-27T07:53:08Z",
+  "sysupgrade": {
+    "name": "ponwrt-airoha-an7581-fiberhome_hg5585f-ct-usb-sfp-squashfs-sysupgrade.itb",
+    "sha256": "05190d987247de37c2846c8fe3b6e8a3e7e527c190dc138ada5fd205c5cf535b",
+    "size": 65392949,
+    "url": "https://github.com/ufo1cn/ponwrt-apk-repo/releases/download/fw-fiberhome_hg5585f-ct-usb-sfp-r58-2b40bf9/ponwrt-airoha-an7581-fiberhome_hg5585f-ct-usb-sfp-squashfs-sysupgrade.itb"
+  }
+}
