@@ -1,21 +1,21 @@
 {
   "schema": 1,
   "device": "znxt_zn504xg-d",
-  "tag": "fw-znxt_zn504xg-d-r58-2b40bf9",
-  "run": 58,
-  "source_run_id": 45960014151,
+  "tag": "fw-znxt_zn504xg-d-r59-c56fd3b",
+  "run": 59,
+  "source_run_id": 46166969370,
   "source_workflow": "fw-all.yml",
-  "commit": "2b40bf9810b493c656a6841007fb251a365ed843",
+  "commit": "c56fd3b816e7a1af5fcda1ebaf22b8596ab43903",
   "kernel_version": "6.18.60",
-  "built_at": "2026-11-27T07:53:08Z",
+  "built_at": "2026-11-28T16:51:44Z",
   "sysupgrade": {
     "name": "ponwrt-airoha-an7581-znxt_zn504xg-d-squashfs-sysupgrade.itb",
-    "sha256": "b81807eddf30e5017f479b0c397ef61a7ce4a932332dbd43344b59ad787f4e34",
-    "size": 65396994,
-    "url": "https://github.com/ufo1cn/ponwrt-apk-repo/releases/download/fw-znxt_zn504xg-d-r58-2b40bf9/ponwrt-airoha-an7581-znxt_zn504xg-d-squashfs-sysupgrade.itb"
+    "sha256": "145e8e1175e23f201af40912e99622b4355e4044e85c6bf776bc7d2ea53b95c8",
+    "size": 65405186,
+    "url": "https://github.com/ufo1cn/ponwrt-apk-repo/releases/download/fw-znxt_zn504xg-d-r59-c56fd3b/ponwrt-airoha-an7581-znxt_zn504xg-d-squashfs-sysupgrade.itb"
   },
   "manifest": {
     "name": "manifest-znxt_zn504xg-d.json",
-    "url": "https://github.com/ufo1cn/ponwrt-apk-repo/releases/download/fw-znxt_zn504xg-d-r58-2b40bf9/manifest-znxt_zn504xg-d.json"
+    "url": "https://github.com/ufo1cn/ponwrt-apk-repo/releases/download/fw-znxt_zn504xg-d-r59-c56fd3b/manifest-znxt_zn504xg-d.json"
   }
 }
