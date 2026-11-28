@@ -1,21 +1,21 @@
 {
   "schema": 1,
   "device": "fiberhome_hg5585f-ct",
-  "tag": "fw-fiberhome_hg5585f-ct-wed-r58-2b40bf9",
-  "run": 58,
-  "source_run_id": 45960014151,
+  "tag": "fw-fiberhome_hg5585f-ct-wed-r59-c56fd3b",
+  "run": 59,
+  "source_run_id": 46166969370,
   "source_workflow": "fw-all.yml",
-  "commit": "2b40bf9810b493c656a6841007fb251a365ed843",
+  "commit": "c56fd3b816e7a1af5fcda1ebaf22b8596ab43903",
   "kernel_version": "6.18.60",
-  "built_at": "2026-11-27T07:53:52Z",
+  "built_at": "2026-11-28T16:51:40Z",
   "sysupgrade": {
     "name": "ponwrt-airoha-an7581-fiberhome_hg5585f-ct-squashfs-sysupgrade.itb",
-    "sha256": "7bdf37ac50b06d137f687f1e1042878f0667978bac111710718c40b8df0eb798",
-    "size": 65421613,
-    "url": "https://github.com/ufo1cn/ponwrt-apk-repo/releases/download/fw-fiberhome_hg5585f-ct-wed-r58-2b40bf9/ponwrt-airoha-an7581-fiberhome_hg5585f-ct-squashfs-sysupgrade.itb"
+    "sha256": "19bff18b3dfeadcb4083fa679acc8e35e1e0c2d50558b197c475fb091f347c1d",
+    "size": 65429805,
+    "url": "https://github.com/ufo1cn/ponwrt-apk-repo/releases/download/fw-fiberhome_hg5585f-ct-wed-r59-c56fd3b/ponwrt-airoha-an7581-fiberhome_hg5585f-ct-squashfs-sysupgrade.itb"
   },
   "manifest": {
     "name": "manifest-fiberhome_hg5585f-ct.json",
-    "url": "https://github.com/ufo1cn/ponwrt-apk-repo/releases/download/fw-fiberhome_hg5585f-ct-wed-r58-2b40bf9/manifest-fiberhome_hg5585f-ct.json"
+    "url": "https://github.com/ufo1cn/ponwrt-apk-repo/releases/download/fw-fiberhome_hg5585f-ct-wed-r59-c56fd3b/manifest-fiberhome_hg5585f-ct.json"
   }
 }
